@@ -27,10 +27,3 @@ def parent_dir_id(relpath: str) -> str:
     """ID of the directory containing a file or directory path."""
     head, _, _ = relpath.strip("/").rpartition("/")
     return dir_id(head)
-
-
-def descendant_prefix(node_id: str) -> str:
-    """Every descendant's ID starts with this string (used for LIKE queries)."""
-    if node_id.endswith("/") or node_id == ROOT_ID:
-        return node_id
-    return node_id + ("." if "#" in node_id else "#")

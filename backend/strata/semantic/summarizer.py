@@ -25,7 +25,9 @@ LEAF_MODEL = "claude-haiku-4-5"  # high volume, low stakes
 BRANCH_MODEL = "claude-opus-5"  # low volume; these are the labels people actually read
 CONCURRENCY = 4
 LOCAL_PREFIX = "ollama:"  # e.g. STRATA_LEAF_MODEL=ollama:qwen2.5-coder:7b
+OPENAI_PREFIX = "openai:"  # any OpenAI-compatible server (llama.cpp, vLLM...) at LLM_API_BASE
 LOCAL_CONCURRENCY = 2  # one GPU; more parallel requests mostly just queue
+SUMMARIZED_KINDS = ("function", "class", "module", "dir")  # variables, imports and blocks show their code instead
 
 
 class Summarizer:
@@ -39,16 +41,20 @@ class Summarizer:
         self.leaf_model = os.environ.get("STRATA_LEAF_MODEL", LEAF_MODEL)
         self.branch_model = os.environ.get("STRATA_BRANCH_MODEL", BRANCH_MODEL)
         self.ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+        self.llm_api_base = os.environ.get("LLM_API_BASE", "http://127.0.0.1:8080").rstrip("/").removesuffix("/v1")
+        # Reasoning models spend most of their time thinking; a one-line label rarely needs it.
+        self.llm_thinking = os.environ.get("STRATA_LLM_THINKING", "").lower() in ("1", "true", "yes")
         self.sem = asyncio.Semaphore(CONCURRENCY)
         self.local_sem = asyncio.Semaphore(LOCAL_CONCURRENCY)
         self.inflight: dict[tuple[str, str], asyncio.Task] = {}
         self.errors: dict[str, str] = {}  # node_id -> last error, cleared on success
+        self.loop: asyncio.AbstractEventLoop | None = None  # set at startup; sync endpoints run in worker threads
 
     def model_for(self, node: dict) -> str:
         return self.leaf_model if node["kind"] == "function" else self.branch_model
 
     def usable(self, model: str) -> bool:
-        return model.startswith(LOCAL_PREFIX) or self.client is not None
+        return model.startswith((LOCAL_PREFIX, OPENAI_PREFIX)) or self.client is not None
 
     @property
     def enabled(self) -> bool:
@@ -56,6 +62,8 @@ class Summarizer:
 
     def status(self, node: dict) -> str:
         """none | pending | error | disabled — the UI renders each differently."""
+        if node["kind"] not in SUMMARIZED_KINDS:
+            return "code"
         if (node["id"], node["ast_hash"]) in self.inflight:
             return "pending"
         if node["id"] in self.errors:
@@ -64,14 +72,14 @@ class Summarizer:
 
     def request(self, node_ids: list[str]):
         """Fire-and-forget: queue summaries for nodes the UI just displayed."""
-        if not self.enabled:
+        if not self.enabled or self.loop is None:
             return
         for nid in node_ids:
-            asyncio.ensure_future(self.ensure(nid))
+            asyncio.run_coroutine_threadsafe(self.ensure(nid), self.loop)
 
     async def ensure(self, node_id: str) -> dict | None:
         node = self.db.node(node_id)
-        if node is None:
+        if node is None or node["kind"] not in SUMMARIZED_KINDS:
             return None
         row = self.db.summary(node_id)
         if row and row["ast_hash"] == node["ast_hash"]:
@@ -129,6 +137,9 @@ class Summarizer:
         if model.startswith(LOCAL_PREFIX):
             async with self.local_sem:
                 return await asyncio.to_thread(self._call_ollama, model.removeprefix(LOCAL_PREFIX), prompt, schema)
+        if model.startswith(OPENAI_PREFIX):
+            async with self.local_sem:
+                return await asyncio.to_thread(self._call_openai, model.removeprefix(OPENAI_PREFIX), prompt, schema)
         async with self.sem:
             if model == "claude-opus-5":
                 response = await self.client.beta.messages.create(
@@ -175,6 +186,31 @@ class Summarizer:
         if reply.get("done_reason") == "length":
             raise RuntimeError("summary was cut off (context/length limit)")
         content = reply["message"]["content"]
+        if plain:
+            line = next((l for l in content.strip().splitlines() if l.strip()), "")
+            return {"summary": line.strip().strip('"').strip()}
+        return json.loads(content)
+
+    def _call_openai(self, model: str, prompt: str, schema: dict) -> dict:
+        """OpenAI-compatible /v1/chat/completions. Same plain-text-leaf rule as _call_ollama."""
+        plain = schema is prompts.LEAF_SCHEMA
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": prompt}],
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": self.llm_thinking},
+        }
+        if not plain:
+            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "summary", "schema": schema}}
+        req = urllib.request.Request(
+            f"{self.llm_api_base}/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            reply = json.load(resp)
+        choice = reply["choices"][0]
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError("summary was cut off (context/length limit)")
+        content = choice["message"].get("content") or ""
         if plain:
             line = next((l for l in content.strip().splitlines() if l.strip()), "")
             return {"summary": line.strip().strip('"').strip()}

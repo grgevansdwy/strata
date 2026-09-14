@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS files (
 -- Directories, modules, classes, functions. `id` is the stable semantic path.
 CREATE TABLE IF NOT EXISTS nodes (
     id         TEXT PRIMARY KEY,
-    kind       TEXT NOT NULL CHECK (kind IN ('dir', 'module', 'class', 'function')),
+    kind       TEXT NOT NULL CHECK (kind IN ('dir', 'module', 'class', 'function', 'variable', 'import', 'block')),
     parent_id  TEXT,
     name       TEXT NOT NULL,
     file       TEXT,                -- NULL for dirs
@@ -30,7 +30,7 @@ CREATE INDEX IF NOT EXISTS nodes_file ON nodes(file);
 CREATE TABLE IF NOT EXISTS edges (
     src      TEXT NOT NULL,
     dst      TEXT NOT NULL,
-    kind     TEXT NOT NULL CHECK (kind IN ('import', 'call')),
+    kind     TEXT NOT NULL CHECK (kind IN ('import', 'call', 'uses', 'member')),
     tier     TEXT NOT NULL CHECK (tier IN ('inferred', 'resolved')),
     src_file TEXT NOT NULL,
     PRIMARY KEY (src, dst, kind, tier)

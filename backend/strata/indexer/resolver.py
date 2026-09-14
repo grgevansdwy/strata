@@ -28,6 +28,8 @@ def resolve_file(index: RepoIndex, rel: str, project: jedi.Project | None = None
     script = jedi.Script(path.read_text(), path=str(path), project=project)
     edges = set()
     for call in pf.calls:
+        if not call.is_call:
+            continue  # plain references stay inferred; Jedi on every name would be slow
         try:
             defs = script.goto(call.line, call.col, follow_imports=True)
         except Exception:  # Jedi raises on odd corners of the language; an unresolved edge is fine.

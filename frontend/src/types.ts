@@ -1,4 +1,4 @@
-export type Kind = 'dir' | 'module' | 'class' | 'function'
+export type Kind = 'class' | 'function' | 'variable' | 'import' | 'block'
 
 export interface SummaryView {
   title: string | null
@@ -9,41 +9,40 @@ export interface SummaryView {
   model?: string
 }
 
-export interface Card {
+export interface GraphNode {
   id: string
   kind: Kind
   name: string
-  file: string | null
-  start_line: number | null
-  end_line: number | null
-  loc: number
-  signature: string | null
-  docstring: string | null
-  callers: number
-  children: number
-  changed_recently: boolean
-  summary: SummaryView
-  summary_status: 'none' | 'pending' | 'error' | 'disabled'
-  error: string | null
-  abs_path?: string
-}
-
-export interface Relation {
-  kind: 'call' | 'import'
-  id: string
-  via: string
-  node_kind: Kind
-  name: string
   file: string
   start_line: number
+  end_line: number
+  loc: number
+  signature: string | null // for variables, imports and blocks: their first line of code
+  docstring: string | null
+  summary: SummaryView
+  summary_status: 'none' | 'pending' | 'error' | 'disabled' | 'code'
+}
+
+export type EdgeKind = 'call' | 'uses' | 'member'
+
+export interface GraphEdge {
+  src: string
+  dst: string
+  kind: EdgeKind
   tier: 'inferred' | 'resolved'
 }
 
-export interface NodeView {
-  node: Card
-  breadcrumb: { id: string; name: string; kind: Kind }[]
-  children: Card[]
-  relations: { calls: Relation[]; called_by: Relation[]; imports: Relation[]; imported_by: Relation[] }
+export interface Roots {
+  entry: string[]
+  functions: string[]
+  tests: string[]
+  other: string[]
+}
+
+export interface Graph {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  roots: Roots
 }
 
 export interface RepoInfo {

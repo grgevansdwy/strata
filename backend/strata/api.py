@@ -1,4 +1,4 @@
-"""FastAPI surface: one screen = one GET /api/node; edits via PATCH; live deltas over /ws."""
+"""FastAPI surface: the whole graph from GET /api/graph; edits via PATCH /api/node; live deltas over /ws."""
 
 import argparse
 import asyncio
@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from strata.db.queries import DB
-from strata.indexer.node_ids import ROOT_ID, descendant_prefix
+from strata.graph import build_graph
 from strata.indexer.repo_index import RepoIndex
 from strata.indexer.resolver import resolve_all, resolve_file
 from strata.indexer.watcher import RepoWatcher
@@ -25,8 +25,11 @@ from strata.semantic.summarizer import Summarizer
 from strata.writeback.patch import Conflict, InvalidEdit, apply_patch, dedent_node, find_node
 
 log = logging.getLogger("strata")
-RECENT_S = 7 * 24 * 3600
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
+class SummaryRequest(BaseModel):
+    ids: list[str]
 
 
 class PatchBody(BaseModel):
@@ -76,6 +79,7 @@ def create_app(repo: Path, db_path: Path, watch: bool = True, resolve: bool = Tr
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        summarizer.loop = asyncio.get_running_loop()
         t = time.time()
         await asyncio.to_thread(index.index_all)
         log.info("indexed %s in %.2fs (%d files)", repo, time.time() - t, len(index.parsed))
@@ -103,29 +107,6 @@ def create_app(repo: Path, db_path: Path, watch: bool = True, resolve: bool = Tr
             raise HTTPException(404, f"no such node: {node_id}")
         return node
 
-    def cards(nodes: list[dict]) -> list[dict]:
-        ids = [n["id"] for n in nodes]
-        summaries = index.db.summaries(ids)
-        callers = index.db.caller_counts(ids)
-        kids = index.db.child_counts(ids)
-        now = time.time()
-        recent = [f for f, row in index.db.files().items() if now - row["mtime"] < RECENT_S]
-        out = []
-        for n in nodes:
-            prefix = descendant_prefix(n["id"]).removeprefix("repo://")
-            changed = any(f == n["file"] or (n["kind"] == "dir" and f.startswith(prefix)) for f in recent)
-            out.append({
-                "id": n["id"], "kind": n["kind"], "name": n["name"], "file": n["file"],
-                "start_line": n["start_line"], "end_line": n["end_line"], "loc": n["loc"],
-                "signature": n["signature"], "docstring": n["docstring"],
-                "callers": callers.get(n["id"], 0), "children": kids.get(n["id"], 0),
-                "changed_recently": changed,
-                "summary": view(n, summaries.get(n["id"])),
-                "summary_status": summarizer.status(n),
-                "error": index.errors.get(n["file"]) if n["kind"] == "module" else None,
-            })
-        return out
-
     @app.get("/api/repo")
     def repo_info():
         return {
@@ -137,22 +118,26 @@ def create_app(repo: Path, db_path: Path, watch: bool = True, resolve: bool = Tr
             },
         }
 
-    @app.get("/api/node")
-    def node_view(id: str = ROOT_ID):
-        node = get_node(id)
-        crumbs, cur = [], node
-        while cur:
-            crumbs.append({"id": cur["id"], "name": cur["name"], "kind": cur["kind"]})
-            cur = index.db.node(cur["parent_id"]) if cur["parent_id"] else None
-        children = index.db.children(id)
-        summarizer.request([id] + [c["id"] for c in children])
-        rel = index.db.relations(id)
-        return {
-            "node": {**cards([node])[0], "abs_path": str(index.root / node["file"]) if node["file"] else str(index.root)},
-            "breadcrumb": list(reversed(crumbs)),
-            "children": cards(children),
-            "relations": rel,
-        }
+    @app.get("/api/graph")
+    def graph():
+        g = build_graph(index)
+        summaries = index.db.summaries([n["id"] for n in g["nodes"]])
+        g["nodes"] = [
+            {
+                "id": n["id"], "kind": n["kind"], "name": n["name"], "file": n["file"],
+                "start_line": n["start_line"], "end_line": n["end_line"], "loc": n["loc"],
+                "signature": n["signature"], "docstring": n["docstring"],
+                "summary": view(n, summaries.get(n["id"])), "summary_status": summarizer.status(n),
+            }
+            for n in g["nodes"]
+        ]
+        return g
+
+    @app.post("/api/summaries")
+    def request_summaries(body: SummaryRequest):
+        """The UI asks for descriptions of the boxes it is showing; results arrive over /ws."""
+        summarizer.request(body.ids)
+        return {"requested": len(body.ids)}
 
     @app.get("/api/source")
     def source(id: str):

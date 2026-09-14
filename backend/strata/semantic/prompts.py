@@ -54,6 +54,9 @@ def branch_prompt(node: dict, own_code: str | None, children: list[tuple[dict, d
         lines = []
         for child, s in children:
             label = child["signature"] or f"{child['kind']} {child['name']}"
+            if child["kind"] in ("variable", "import", "block"):
+                lines.append(f"- {label}")  # the signature is the code line itself
+                continue
             desc = (f"{s['title']}: {s['summary']}" if s and s.get("title") else s["summary"]) if s else "(no summary)"
             lines.append(f"- {label} — {desc}")
         parts.append("Its members:\n" + "\n".join(lines))

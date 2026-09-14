@@ -50,6 +50,12 @@ def build_inferred_edges(parsed: dict[str, ParsedFile]) -> list[Edge]:
 
     for rel, pf in parsed.items():
         src_mod = module_id(rel)
+        # A class or function points at what it defines: fields, methods, nested functions.
+        for n in pf.nodes:
+            if kinds.get(n.parent_id) in ("class", "function"):
+                edges.add((n.parent_id, n.id, "member", "inferred", rel))
+        # Names bound by a module-level import statement; the fallback target for anything external.
+        import_nodes = {b.local: b.node_id for b in pf.imports if kinds.get(b.node_id) == "import"}
         # local name -> ("module", relpath) | ("symbol", node_id)
         bindings: dict[str, tuple[str, str]] = {}
         for b in pf.imports:
@@ -72,9 +78,10 @@ def build_inferred_edges(parsed: dict[str, ParsedFile]) -> list[Edge]:
                     bindings[b.local] = ("symbol", sid)
 
         for call in pf.calls:
-            dst = _resolve_call(call, rel, bindings, known_ids, kinds)
-            if dst and dst != call.src:
-                edges.add((call.src, dst, "call", "inferred", rel))
+            dst = _resolve_call(call, rel, bindings, known_ids, kinds) or import_nodes.get(call.chain[0])
+            if dst and dst != call.src and kinds.get(dst) != "module":
+                kind = "call" if call.is_call and kinds.get(dst) in ("function", "class") else "uses"
+                edges.add((call.src, dst, kind, "inferred", rel))
     return sorted(edges)
 
 
@@ -102,7 +109,7 @@ def _member(owner_id: str, rest: list[str], known_ids: set, kinds: dict) -> str 
 
 def _resolve_call(call, rel, bindings, known_ids, kinds) -> str | None:
     chain = call.chain
-    if chain[0] in ("self", "cls") and call.enclosing_class and len(chain) == 2:
+    if chain[0] in ("self", "cls") and call.enclosing_class and len(chain) >= 2:
         cand = symbol_id(rel, f"{call.enclosing_class}.{chain[1]}")
         return cand if cand in known_ids else None
 
@@ -113,7 +120,8 @@ def _resolve_call(call, rel, bindings, known_ids, kinds) -> str | None:
         base = ".".join(scope[:depth] + [chain[0]])
         cand = symbol_id(rel, base)
         if cand in known_ids:
-            return _member(cand, chain[1:], known_ids, kinds) if len(chain) > 1 else cand
+            # `CONFIG.url`, `Config.from_env()`: an unknown attribute still points at the owner.
+            return (_member(cand, chain[1:], known_ids, kinds) or cand) if len(chain) > 1 else cand
 
     # Imported names: longest dotted prefix that is bound (handles `import a.b; a.b.f()`).
     for k in range(len(chain), 0, -1):
@@ -125,5 +133,5 @@ def _resolve_call(call, rel, bindings, known_ids, kinds) -> str | None:
         owner = module_id(target) if kind == "module" else target
         if not rest:
             return owner if kind == "symbol" else None
-        return _member(owner, rest, known_ids, kinds)
+        return _member(owner, rest, known_ids, kinds) or (owner if kind == "symbol" else None)
     return None

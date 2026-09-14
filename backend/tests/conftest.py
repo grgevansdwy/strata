@@ -25,3 +25,6 @@ def effigov_copy(tmp_path) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
     return dst
+
+# tests/fixtures holds sample repos (including their own test files) that are data, not tests.
+collect_ignore_glob = ["fixtures/*"]

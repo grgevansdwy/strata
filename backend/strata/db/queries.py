@@ -4,16 +4,12 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from strata.indexer.node_ids import descendant_prefix
+SCHEMA_VERSION = 2  # bump when schema.sql changes; the index is rebuilt, summaries are kept
 
 NODE_COLS = (
     "id, kind, parent_id, name, file, start_byte, end_byte, start_line, end_line, "
     "indent, ast_hash, src_hash, loc, signature, docstring, ordinal"
 )
-
-
-def _like_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class DB:
@@ -22,6 +18,9 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.lock = threading.RLock()
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            self.conn.executescript("DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS files;")
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.executescript((Path(__file__).parent / "schema.sql").read_text())
 
     # -- writes -------------------------------------------------------------------------------
@@ -97,6 +96,12 @@ class DB:
     def all_nodes(self) -> list[dict]:
         return self._all(f"SELECT {NODE_COLS} FROM nodes")
 
+    def graph_edges(self) -> list[dict]:
+        """One row per (src, dst, kind); 'resolved' wins over 'inferred'. Module imports are left out."""
+        return self._all(
+            "SELECT src, dst, kind, MAX(tier) AS tier FROM edges WHERE kind != 'import' GROUP BY src, dst, kind"
+        )
+
     def files(self) -> dict[str, dict]:
         return {r["path"]: r for r in self._all("SELECT * FROM files")}
 
@@ -109,48 +114,3 @@ class DB:
             return {}
         q = ",".join("?" * len(node_ids))
         return {r["node_id"]: r for r in self._all(f"SELECT * FROM summaries WHERE node_id IN ({q})", node_ids)}
-
-    def caller_counts(self, node_ids: list[str]) -> dict[str, int]:
-        if not node_ids:
-            return {}
-        q = ",".join("?" * len(node_ids))
-        rows = self._all(
-            f"SELECT dst, COUNT(DISTINCT src) AS n FROM edges WHERE kind = 'call' AND dst IN ({q}) GROUP BY dst",
-            node_ids,
-        )
-        return {r["dst"]: r["n"] for r in rows}
-
-    def child_counts(self, node_ids: list[str]) -> dict[str, int]:
-        if not node_ids:
-            return {}
-        q = ",".join("?" * len(node_ids))
-        rows = self._all(f"SELECT parent_id, COUNT(*) AS n FROM nodes WHERE parent_id IN ({q}) GROUP BY parent_id", node_ids)
-        return {r["parent_id"]: r["n"] for r in rows}
-
-    def relations(self, node_id: str) -> dict[str, list[dict]]:
-        """Edges touching this node or any descendant, excluding edges internal to the subtree.
-
-        If both an inferred and a resolved edge exist for the same pair, only 'resolved' is reported.
-        """
-        prefix = _like_escape(descendant_prefix(node_id)) + "%"
-        inside = "(e.{col} = :id OR e.{col} LIKE :prefix ESCAPE '\\')"
-        out_sql = f"""
-            SELECT e.kind, e.src AS via, n.id, n.kind AS node_kind, n.name, n.file, n.start_line,
-                   MAX(e.tier) AS tier  -- 'resolved' > 'inferred'
-            FROM edges e JOIN nodes n ON n.id = e.dst
-            WHERE {inside.format(col='src')} AND NOT {inside.format(col='dst')}
-            GROUP BY e.kind, n.id ORDER BY e.kind, n.file, n.start_line"""
-        in_sql = f"""
-            SELECT e.kind, e.dst AS via, n.id, n.kind AS node_kind, n.name, n.file, n.start_line,
-                   MAX(e.tier) AS tier
-            FROM edges e JOIN nodes n ON n.id = e.src
-            WHERE {inside.format(col='dst')} AND NOT {inside.format(col='src')}
-            GROUP BY e.kind, n.id ORDER BY e.kind, n.file, n.start_line"""
-        args = {"id": node_id, "prefix": prefix}
-        out_rows, in_rows = self._all(out_sql, args), self._all(in_sql, args)
-        return {
-            "calls": [r for r in out_rows if r["kind"] == "call"],
-            "called_by": [r for r in in_rows if r["kind"] == "call"],
-            "imports": [r for r in out_rows if r["kind"] == "import"],
-            "imported_by": [r for r in in_rows if r["kind"] == "import"],
-        }

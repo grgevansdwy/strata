@@ -73,7 +73,5 @@ def test_syntax_error_keeps_last_good_nodes(effigov_copy, tmp_path):
 
 def test_known_edges(effigov_copy, tmp_path):
     idx = _index(effigov_copy, tmp_path)
-    rel = idx.db.relations("repo://services/api/app/main.py#health")
-    assert "repo://services/api/app/db.py#get_client" in {r["id"] for r in rel["calls"]}
-    mod = idx.db.relations("repo://services/api/app/main.py")
-    assert "repo://services/api/app/db.py" in {r["id"] for r in mod["imports"]}
+    edges = {(e["src"], e["dst"], e["kind"]) for e in idx.db.graph_edges()}
+    assert ("repo://services/api/app/main.py#health", "repo://services/api/app/db.py#get_client", "call") in edges
