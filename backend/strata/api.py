@@ -131,6 +131,10 @@ def create_app(repo: Path, db_path: Path, watch: bool = True, resolve: bool = Tr
         return {
             "name": index.root.name, "root": str(index.root), "files": len(index.parsed),
             "errors": index.errors, "summaries_enabled": summarizer.enabled, "resolver": state["resolver"],
+            "models": {
+                "leaf": summarizer.leaf_model, "leaf_ready": summarizer.usable(summarizer.leaf_model),
+                "branch": summarizer.branch_model, "branch_ready": summarizer.usable(summarizer.branch_model),
+            },
         }
 
     @app.get("/api/node")

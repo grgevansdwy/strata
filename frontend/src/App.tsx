@@ -12,6 +12,22 @@ import { useStrataSocket } from './useStrataSocket'
 const ROOT = 'repo://'
 const idFromUrl = () => new URLSearchParams(location.search).get('id') ?? ROOT
 
+const shortModel = (m: string) => m.replace(/^ollama:/, '').replace(/^claude-/, '')
+
+function ModelsPill({ models }: { models: RepoInfo['models'] }) {
+  const part = (label: string, model: string, ready: boolean) =>
+    `${label} ${ready ? shortModel(model) + (model.startsWith('ollama:') ? ' (local)' : '') : 'off'}`
+  const allReady = models.leaf_ready && models.branch_ready
+  return (
+    <span
+      className={`pill ${allReady ? 'ok' : 'warn'}`}
+      title={allReady ? 'Summary models' : 'Claude-backed summaries need ANTHROPIC_API_KEY in backend/.env'}
+    >
+      {part('fn', models.leaf, models.leaf_ready)} · {part('branches', models.branch, models.branch_ready)}
+    </span>
+  )
+}
+
 const CHILD_LABEL: Record<string, string> = { dir: 'Contents', module: 'Symbols', class: 'Members', function: 'Inner functions' }
 
 export default function App() {
@@ -118,7 +134,7 @@ export default function App() {
           </span>
         )}
         {repo && <span className={`pill ${repo.resolver === 'done' ? 'ok' : ''}`}>{repo.resolver === 'done' ? 'refs resolved' : 'resolving refs…'}</span>}
-        {repo && <span className={`pill ${repo.summaries_enabled ? 'ok' : 'warn'}`}>{repo.summaries_enabled ? 'summaries on' : 'summaries off: no API key'}</span>}
+        {repo && <ModelsPill models={repo.models} />}
         <span className={`pill ${connected ? 'ok' : 'warn'}`}>{connected ? 'live' : 'offline'}</span>
       </header>
 

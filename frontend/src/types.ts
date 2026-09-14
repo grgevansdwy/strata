@@ -53,6 +53,7 @@ export interface RepoInfo {
   errors: Record<string, string>
   summaries_enabled: boolean
   resolver: 'pending' | 'done' | 'off'
+  models: { leaf: string; leaf_ready: boolean; branch: string; branch_ready: boolean }
 }
 
 export interface Source {

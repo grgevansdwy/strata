@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import urllib.request
 from typing import Awaitable, Callable
 
 import anthropic
@@ -23,6 +24,8 @@ log = logging.getLogger("strata.summarizer")
 LEAF_MODEL = "claude-haiku-4-5"  # high volume, low stakes
 BRANCH_MODEL = "claude-opus-5"  # low volume; these are the labels people actually read
 CONCURRENCY = 4
+LOCAL_PREFIX = "ollama:"  # e.g. STRATA_LEAF_MODEL=ollama:qwen2.5-coder:7b
+LOCAL_CONCURRENCY = 2  # one GPU; more parallel requests mostly just queue
 
 
 class Summarizer:
@@ -33,13 +36,23 @@ class Summarizer:
         if client is None and os.environ.get("ANTHROPIC_API_KEY"):
             client = anthropic.AsyncAnthropic()
         self.client = client
+        self.leaf_model = os.environ.get("STRATA_LEAF_MODEL", LEAF_MODEL)
+        self.branch_model = os.environ.get("STRATA_BRANCH_MODEL", BRANCH_MODEL)
+        self.ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
         self.sem = asyncio.Semaphore(CONCURRENCY)
+        self.local_sem = asyncio.Semaphore(LOCAL_CONCURRENCY)
         self.inflight: dict[tuple[str, str], asyncio.Task] = {}
         self.errors: dict[str, str] = {}  # node_id -> last error, cleared on success
 
+    def model_for(self, node: dict) -> str:
+        return self.leaf_model if node["kind"] == "function" else self.branch_model
+
+    def usable(self, model: str) -> bool:
+        return model.startswith(LOCAL_PREFIX) or self.client is not None
+
     @property
     def enabled(self) -> bool:
-        return self.client is not None
+        return self.usable(self.leaf_model) or self.usable(self.branch_model)
 
     def status(self, node: dict) -> str:
         """none | pending | error | disabled — the UI renders each differently."""
@@ -47,7 +60,7 @@ class Summarizer:
             return "pending"
         if node["id"] in self.errors:
             return "error"
-        return "none" if self.enabled else "disabled"
+        return "none" if self.usable(self.model_for(node)) else "disabled"
 
     def request(self, node_ids: list[str]):
         """Fire-and-forget: queue summaries for nodes the UI just displayed."""
@@ -63,6 +76,8 @@ class Summarizer:
         row = self.db.summary(node_id)
         if row and row["ast_hash"] == node["ast_hash"]:
             return row
+        if not self.usable(self.model_for(node)):
+            return None
         key = (node_id, node["ast_hash"])
         if key not in self.inflight:
             task = asyncio.ensure_future(self._generate(node))
@@ -75,17 +90,18 @@ class Summarizer:
 
     async def _generate(self, node: dict) -> dict | None:
         try:
+            model = self.model_for(node)
             if node["kind"] == "function":
                 source = self._source(node)
-                data = await self._call(LEAF_MODEL, prompts.leaf_prompt(node, source), prompts.LEAF_SCHEMA)
-                model = LEAF_MODEL
+                data = await self._call(model, prompts.leaf_prompt(node, source), prompts.LEAF_SCHEMA)
             else:
                 children = self.db.children(node["id"])
                 child_rows = await asyncio.gather(*(self.ensure(c["id"]) for c in children))
                 own = None if node["kind"] == "dir" else self._own_code(node, children)
                 prompt = prompts.branch_prompt(node, own, list(zip(children, child_rows)))
-                data = await self._call(BRANCH_MODEL, prompt, prompts.BRANCH_SCHEMA)
-                model = BRANCH_MODEL
+                data = await self._call(model, prompt, prompts.BRANCH_SCHEMA)
+            if len(data.get("summary", "").split()) < 3:
+                raise RuntimeError(f"unusable summary from {model}: {data.get('summary')!r}")
         except Exception as e:
             self.errors[node["id"]] = f"{type(e).__name__}: {e}"
             log.warning("summary failed for %s: %s", node["id"], e)
@@ -110,8 +126,11 @@ class Summarizer:
         return row
 
     async def _call(self, model: str, prompt: str, schema: dict) -> dict:
+        if model.startswith(LOCAL_PREFIX):
+            async with self.local_sem:
+                return await asyncio.to_thread(self._call_ollama, model.removeprefix(LOCAL_PREFIX), prompt, schema)
         async with self.sem:
-            if model == BRANCH_MODEL:
+            if model == "claude-opus-5":
                 response = await self.client.beta.messages.create(
                     model=model,
                     max_tokens=4000,
@@ -135,6 +154,31 @@ class Summarizer:
             raise RuntimeError("summary was cut off (max_tokens)")
         text = next(b.text for b in response.content if b.type == "text")
         return json.loads(text)
+
+    def _call_ollama(self, model: str, prompt: str, schema: dict) -> dict:
+        # Schema-constrained decoding makes small models stop after one word ("Returns"), so a
+        # single-sentence leaf summary is requested as plain text; branches still need JSON.
+        plain = schema is prompts.LEAF_SCHEMA
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": prompts.SYSTEM}, {"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        if not plain:
+            body["format"] = schema
+        req = urllib.request.Request(
+            f"{self.ollama_host}/api/chat", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            reply = json.load(resp)
+        if reply.get("done_reason") == "length":
+            raise RuntimeError("summary was cut off (context/length limit)")
+        content = reply["message"]["content"]
+        if plain:
+            line = next((l for l in content.strip().splitlines() if l.strip()), "")
+            return {"summary": line.strip().strip('"').strip()}
+        return json.loads(content)
 
     def _source(self, node: dict) -> str:
         data = (self.index.root / node["file"]).read_bytes()

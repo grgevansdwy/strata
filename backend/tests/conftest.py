@@ -4,18 +4,24 @@ from pathlib import Path
 
 import pytest
 
+from strata.indexer.repo_index import is_indexable
+
 EFFIGOV = Path(os.environ.get("STRATA_TEST_REPO", Path.home() / "Documents/effigov"))
 
 
 @pytest.fixture
 def effigov_copy(tmp_path) -> Path:
-    """A private copy of the real test repo: tests never touch the original."""
+    """A private copy of the test repo's indexable .py files: tests never touch the original.
+
+    Only .py files are copied; build output like .next or node_modules would cost hundreds of MB per test.
+    """
     if not EFFIGOV.is_dir():
         pytest.skip(f"test repo not found: {EFFIGOV}")
     dst = tmp_path / "effigov"
-    shutil.copytree(
-        EFFIGOV,
-        dst,
-        ignore=shutil.ignore_patterns(".git", "node_modules", ".env*", "venv", ".venv", "__pycache__"),
-    )
+    for path in EFFIGOV.rglob("*.py"):
+        rel = path.relative_to(EFFIGOV).as_posix()
+        if is_indexable(rel) and path.is_file():
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
     return dst
