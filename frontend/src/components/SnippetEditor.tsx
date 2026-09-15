@@ -4,7 +4,7 @@ import { indentUnit } from '@codemirror/language'
 import { MergeView } from '@codemirror/merge'
 import { EditorSelection, EditorState, type Extension } from '@codemirror/state'
 import { oneDark } from '@codemirror/theme-one-dark'
-import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view'
+import { Decoration, EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, vscodeUrl } from '../api'
 import type { Source } from '../types'
@@ -32,9 +32,10 @@ function baseExtensions(startLine: number, readOnly: boolean): Extension[] {
   ]
 }
 
-export function SnippetEditor({ nodeId, editable, version, onSaved }: {
+export function SnippetEditor({ nodeId, editable, version, onSaved, highlight = [] }: {
   nodeId: string
   editable: boolean
+  highlight?: number[] // absolute file line numbers to mark (a tour step's key lines)
   version: number // bumped when the file changed on disk
   onSaved: (newNodeId: string | null) => void
 }) {
@@ -115,12 +116,21 @@ export function SnippetEditor({ nodeId, editable, version, onSaved }: {
           keymap.of([{ key: 'Mod-s', preventDefault: true, run: () => (saveRef.current(), true) }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
           ...baseExtensions(src.start_line, !editable),
           EditorView.updateListener.of((u) => { if (u.docChanged) setDirty(u.state.doc.toString() !== src.source) }),
+          EditorView.decorations.of((view) => Decoration.set(
+            highlight
+              .map((abs) => abs - src.start_line + 1)
+              .filter((n) => n >= 1 && n <= view.state.doc.lines)
+              .map((n) => Decoration.line({ class: 'cm-flow-line' }).range(view.state.doc.line(n).from)),
+          )),
         ],
       }),
     })
     view.current = v
+    const first = highlight.map((abs) => abs - src.start_line + 1).find((n) => n >= 1 && n <= v.state.doc.lines)
+    if (first) v.dispatch({ effects: EditorView.scrollIntoView(v.state.doc.line(first).from, { y: 'center' }) })
     return () => { v.destroy(); view.current = null }
-  }, [src, editable])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src, editable, highlight.join(',')])
 
   useEffect(() => {
     if (!conflict || !mergeHost.current || !view.current) return

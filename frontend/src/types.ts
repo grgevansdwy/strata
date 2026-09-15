@@ -23,13 +23,14 @@ export interface GraphNode {
   summary_status: 'none' | 'pending' | 'error' | 'disabled' | 'code'
 }
 
-export type EdgeKind = 'call' | 'uses' | 'member'
+export type EdgeKind = 'call' | 'uses' | 'member' | 'flow' // flow: tour steps with no direct line
 
 export interface GraphEdge {
   src: string
   dst: string
   kind: EdgeKind
   tier: 'inferred' | 'resolved'
+  site: number // line * 10000 + col of the reference in src: children read left to right in this order
 }
 
 export interface Roots {
@@ -68,3 +69,30 @@ export type ServerEvent =
   | ({ type: 'summary'; node_id: string } & SummaryView)
   | { type: 'summary_error'; node_id: string; error: string }
   | { type: 'edges' }
+
+export interface TourStep {
+  node_id: string
+  explanation: string
+  lines: number[] // absolute line numbers in the box's file
+}
+
+export interface Tour {
+  title: string
+  overview: string
+  steps: TourStep[]
+}
+
+export type Answer = Tour | { text: string }
+
+export type AskEvent =
+  | { type: 'progress'; text: string }
+  | ({ type: 'tour' } & Tour)
+  | { type: 'answer'; text: string }
+  | { type: 'error'; message: string }
+
+export interface Turn {
+  question: string
+  progress: string[]
+  answer?: Answer
+  error?: string
+}

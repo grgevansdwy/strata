@@ -2,11 +2,13 @@ import { Background, Controls, MarkerType, ReactFlow, ReactFlowProvider, useReac
 import '@xyflow/react/dist/style.css'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
+import { AskPanel } from './components/AskPanel'
 import { Box, type BoxNode } from './components/Box'
 import { DetailPanel } from './components/DetailPanel'
 import { RootList } from './components/RootList'
+import { TourCard } from './components/TourCard'
 import { BOX_H, BOX_W, layout, visibleIds } from './layout'
-import type { Graph, GraphEdge, GraphNode, RepoInfo, ServerEvent } from './types'
+import type { Answer, Graph, GraphEdge, GraphNode, RepoInfo, ServerEvent, Tour, Turn } from './types'
 import { useStrataSocket } from './useStrataSocket'
 
 const shortModel = (m: string) => m.replace(/^(ollama|openai):/, '').replace(/^claude-/, '')
@@ -33,6 +35,13 @@ function Strata() {
   const [selected, setSelected] = useState<string | null>(null)
   const [flash, setFlash] = useState<Set<string>>(new Set())
   const [diskVersion, setDiskVersion] = useState(0)
+  const [tab, setTab] = useState<'roots' | 'ask'>('roots')
+  const [turns, setTurns] = useState<Turn[]>([])
+  const [running, setRunning] = useState(false)
+  const [tour, setTour] = useState<Tour | null>(null)
+  const [step, setStep] = useState(0)
+  const tourRef = useRef(tour)
+  tourRef.current = tour
   const requested = useRef(new Set<string>())
   const selectedRef = useRef(selected)
   selectedRef.current = selected
@@ -67,10 +76,16 @@ function Strata() {
       outEdges.set(e.src, [...(outEdges.get(e.src) ?? []), e])
       incoming.set(e.dst, [...(incoming.get(e.dst) ?? []), e])
     }
+    for (const list of outEdges.values()) list.sort((a, b) => a.site - b.site) // code order, like the graph
     return { byId, out, incoming, outEdges }
   }, [graph])
 
-  const visible = useMemo(() => visibleIds(pinned, expanded, out), [pinned, expanded, out])
+  const explored = useMemo(() => visibleIds(pinned, expanded, out), [pinned, expanded, out])
+  // A tour replaces the explored graph with just its boxes; exiting brings the explored graph back as it was.
+  const visible = useMemo(
+    () => (tour ? new Set(tour.steps.map((s) => s.node_id).filter((id) => byId.has(id))) : explored),
+    [tour, explored, byId],
+  )
 
   const patchNodes = (ids: Set<string>, fn: (n: GraphNode) => GraphNode) =>
     setGraph((g) => g && { ...g, nodes: g.nodes.map((n) => (ids.has(n.id) ? fn(n) : n)) })
@@ -124,13 +139,55 @@ function Strata() {
 
   /** Show a box (pinning it if nothing on screen leads to it), select it and open what it points at. */
   const open = useCallback((id: string) => {
-    if (!visible.has(id)) setPinned((p) => toggle(p, id, true))
+    setTour(null)
+    if (!explored.has(id)) setPinned((p) => toggle(p, id, true))
     setExpanded((x) => toggle(x, id, true))
     setSelected(id)
     centerOn(id)
-  }, [visible, centerOn])
+  }, [explored, centerOn])
+
+  const goStep = useCallback((t: Tour, i: number) => {
+    setTour(t)
+    setStep(i)
+    setSelected(t.steps[i].node_id)
+    centerOn(t.steps[i].node_id)
+  }, [centerOn])
+
+  const exitTour = () => {
+    setTour(null)
+    setSelected(null)
+  }
+
+  const ask = async (question: string) => {
+    const history = turns.filter((t) => t.answer).map((t) => ({ question: t.question, answer: t.answer as Answer }))
+    const index = turns.length
+    const update = (fn: (t: Turn) => Turn) => setTurns((ts) => ts.map((t, i) => (i === index ? fn(t) : t)))
+    setTurns((ts) => [...ts, { question, progress: [] }])
+    setRunning(true)
+    try {
+      for await (const e of api.ask(question, history, selected)) {
+        if (e.type === 'progress') update((t) => ({ ...t, progress: [...t.progress, e.text] }))
+        else if (e.type === 'answer') update((t) => ({ ...t, answer: { text: e.text } }))
+        else if (e.type === 'error') update((t) => ({ ...t, error: e.message }))
+        else {
+          const { type: _t, ...answer } = e
+          update((t) => ({ ...t, answer }))
+          goStep(answer, 0)
+        }
+      }
+    } catch (err) {
+      update((t) => ({ ...t, error: String(err) }))
+    } finally {
+      setRunning(false)
+    }
+  }
 
   const onBoxClick = (id: string) => {
+    if (tour) {
+      const i = tour.steps.findIndex((s) => s.node_id === id)
+      if (i >= 0) goStep(tour, i)
+      return
+    }
     if (selected === id) setExpanded((x) => toggle(x, id)) // second click collapses / re-expands
     else {
       setSelected(id)
@@ -141,7 +198,9 @@ function Strata() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !(e.target as HTMLElement).closest('.cm-editor')) setSelected(null)
+      if (e.key !== 'Escape' || (e.target as HTMLElement).closest('.cm-editor, textarea')) return
+      if (tourRef.current) setTour(null)
+      setSelected(null)
     }
     addEventListener('keydown', onKey)
     return () => removeEventListener('keydown', onKey)
@@ -151,6 +210,15 @@ function Strata() {
     if (!graph) return { nodes: [] as BoxNode[], edges: [] as Edge[] }
     const ids = [...visible].filter((id) => byId.has(id))
     const shown = graph.edges.filter((e) => visible.has(e.src) && visible.has(e.dst))
+    // In a tour, consecutive steps without a direct line still get one, so the path reads top to bottom.
+    tour?.steps.slice(1).forEach((s, i) => {
+      const prev = tour.steps[i].node_id
+      if (prev !== s.node_id && !shown.some((e) => (e.src === prev && e.dst === s.node_id) || (e.src === s.node_id && e.dst === prev))) {
+        shown.push({ src: prev, dst: s.node_id, kind: 'flow', tier: 'inferred', site: i })
+      }
+    })
+    const stepOf = new Map<string, number>()
+    tour?.steps.forEach((s, i) => { if (!stepOf.has(s.node_id)) stepOf.set(s.node_id, i + 1) })
     const pos = layout(ids, shown)
     const nodes: BoxNode[] = ids.map((id) => ({
       id,
@@ -164,6 +232,7 @@ function Strata() {
         expanded: expanded.has(id),
         selected: selected === id,
         flash: flash.has(id),
+        step: stepOf.get(id),
       },
     }))
     const edges: Edge[] = shown.map((e) => {
@@ -178,9 +247,10 @@ function Strata() {
       }
     })
     return { nodes, edges }
-  }, [graph, visible, byId, out, expanded, selected, flash])
+  }, [graph, visible, byId, out, expanded, selected, flash, tour])
 
   const selectedNode = selected ? byId.get(selected) : undefined
+  const tourStep = tour && tour.steps[step]?.node_id === selected ? tour.steps[step] : undefined
 
   return (
     <div className="app">
@@ -201,15 +271,31 @@ function Strata() {
       {error && <div className="notice error">{error}</div>}
 
       <div className={`body ${selectedNode ? 'with-detail' : ''}`}>
-        {graph && (
-          <RootList
-            roots={graph.roots}
-            byId={byId}
-            pinned={pinned}
-            onToggle={(id) => setPinned((p) => toggle(p, id))}
-            onFocus={open}
-          />
-        )}
+        <aside className="sidebar">
+          <div className="tabs">
+            <button className={tab === 'roots' ? 'on' : ''} onClick={() => setTab('roots')}>Roots</button>
+            <button className={tab === 'ask' ? 'on' : ''} onClick={() => setTab('ask')}>Ask{running ? ' ·' : ''}</button>
+          </div>
+          {graph && tab === 'roots' && (
+            <RootList
+              roots={graph.roots}
+              byId={byId}
+              pinned={pinned}
+              onToggle={(id) => { setTour(null); setPinned((p) => toggle(p, id)) }}
+              onFocus={open}
+            />
+          )}
+          {tab === 'ask' && (
+            <AskPanel
+              turns={turns}
+              running={running}
+              selected={selectedNode}
+              onAsk={ask}
+              onOpenTour={(t) => goStep(t, 0)}
+              onClearSelection={() => { setTour(null); setSelected(null) }}
+            />
+          )}
+        </aside>
         <main className="graph">
           {/* Mounted once boxes exist, so fitView frames the first graph rather than an empty one. */}
           {nodes.length > 0 && <ReactFlow
@@ -217,7 +303,7 @@ function Strata() {
             edges={edges}
             nodeTypes={nodeTypes}
             onNodeClick={(_, n) => onBoxClick(n.id)}
-            onPaneClick={() => setSelected(null)}
+            onPaneClick={() => { if (!tour) setSelected(null) }}
             nodesDraggable={false}
             nodesConnectable={false}
             colorMode="dark"
@@ -234,18 +320,22 @@ function Strata() {
             <span><i className="line call" /> calls</span>
             <span><i className="line uses" /> uses</span>
             <span><i className="line member" /> defines</span>
-            <span className="muted">click a box to open it · click again to collapse</span>
+            {tour && <span><i className="line flow" /> tour path</span>}
+            <span className="muted">{tour ? 'click a numbered box to jump to that step' : 'click a box to open it · click again to collapse'}</span>
           </div>
+          {tour && <TourCard tour={tour} step={step} byId={byId} onStep={(i) => goStep(tour, i)} onExit={exitTour} />}
         </main>
         {selectedNode && (
           <DetailPanel
-            key={selectedNode.id}
+            key={`${selectedNode.id}:${tourStep ? step : ''}`}
             node={selectedNode}
+            note={tourStep?.explanation}
+            highlight={tourStep?.lines}
             outgoing={outEdges.get(selectedNode.id) ?? []}
             incoming={incoming.get(selectedNode.id) ?? []}
             byId={byId}
             version={diskVersion}
-            onClose={() => setSelected(null)}
+            onClose={() => (tour ? exitTour() : setSelected(null))}
             onOpenTarget={open}
             onOpenSource={open}
             onSaved={(newId) => newId && setSelected(newId)}

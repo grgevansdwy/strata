@@ -31,8 +31,10 @@ function Links({ title, items, byId, onPick }: {
   )
 }
 
-export function DetailPanel({ node, outgoing, incoming, byId, version, onClose, onOpenTarget, onOpenSource, onSaved }: {
+export function DetailPanel({ node, outgoing, incoming, byId, version, onClose, onOpenTarget, onOpenSource, onSaved, note, highlight }: {
   node: GraphNode
+  note?: string // the tour's explanation for this step
+  highlight?: number[]
   outgoing: GraphEdge[]
   incoming: GraphEdge[]
   byId: Map<string, GraphNode>
@@ -52,8 +54,9 @@ export function DetailPanel({ node, outgoing, incoming, byId, version, onClose, 
         <button className="btn ghost small" onClick={onClose} title="Close (Esc)">✕</button>
       </header>
       <div className="detail-meta">{node.file}:{node.start_line}–{node.end_line} · {node.loc} lines{node.summary.model ? ` · ${node.summary.model}` : ''}</div>
+      {note && <div className="step-note">{note}</div>}
       {node.summary_status !== 'code' && <Summary node={node} />}
-      <SnippetEditor nodeId={node.id} editable={editable} version={version} onSaved={onSaved} />
+      <SnippetEditor nodeId={node.id} editable={editable} version={version} onSaved={onSaved} highlight={highlight} />
       <Links title="Points to" items={outgoing.map((e) => ({ id: e.dst, kind: e.kind }))} byId={byId} onPick={onOpenTarget} />
       <Links title="Pointed to by" items={incoming.map((e) => ({ id: e.src, kind: e.kind }))} byId={byId} onPick={onOpenSource} />
     </aside>

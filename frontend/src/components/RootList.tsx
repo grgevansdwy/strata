@@ -16,7 +16,7 @@ export function RootList({ roots, byId, pinned, onToggle, onFocus }: {
   onFocus: (id: string) => void
 }) {
   return (
-    <aside className="roots">
+    <div className="roots">
       {SECTIONS.map(({ key, label, hint, open }) => (
         <details key={key} open={open && roots[key].length > 0}>
           <summary title={hint}>{label}<span className="count">{roots[key].length}</span></summary>
@@ -40,6 +40,6 @@ export function RootList({ roots, byId, pinned, onToggle, onFocus }: {
           </ul>
         </details>
       ))}
-    </aside>
+    </div>
   )
 }
